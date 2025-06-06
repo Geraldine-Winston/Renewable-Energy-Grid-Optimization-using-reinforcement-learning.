@@ -1,0 +1,143 @@
+import numpy as np
+import gym
+from gym import spaces
+import random
+import tensorflow as tf
+from tensorflow.keras import layers
+
+# Custom Environment
+class RenewableGridEnv(gym.Env):
+    def __init__(self):
+        super(RenewableGridEnv, self).__init__()
+        
+        # Define action and observation space
+        # Actions: 0 = store energy, 1 = use energy, 2 = sell excess
+        self.action_space = spaces.Discrete(3)
+        
+        # Observations: [demand, solar_generation, wind_generation, battery_level]
+        self.observation_space = spaces.Box(low=0, high=1, shape=(4,), dtype=np.float32)
+        
+        # Environment parameters
+        self.max_battery_capacity = 1.0  # normalized
+        self.battery_level = 0.5
+        
+        # Random initialization
+        self.demand = np.random.uniform(0.3, 0.8)
+        self.solar_generation = np.random.uniform(0.2, 0.7)
+        self.wind_generation = np.random.uniform(0.1, 0.5)
+        
+    def reset(self):
+        self.battery_level = 0.5
+        self.demand = np.random.uniform(0.3, 0.8)
+        self.solar_generation = np.random.uniform(0.2, 0.7)
+        self.wind_generation = np.random.uniform(0.1, 0.5)
+        return np.array([self.demand, self.solar_generation, self.wind_generation, self.battery_level], dtype=np.float32)
+    
+    def step(self, action):
+        total_generation = self.solar_generation + self.wind_generation
+        
+        reward = 0
+        done = False
+        
+        # Actions
+        if action == 0:  # store energy
+            available_storage = self.max_battery_capacity - self.battery_level
+            store = min(total_generation, available_storage)
+            self.battery_level += store
+            reward = store * 2  # reward storing for later use
+            
+        elif action == 1:  # use energy
+            supply = total_generation + self.battery_level
+            if supply >= self.demand:
+                reward = 10  # successfully meet demand
+                self.battery_level -= max(0, self.demand - total_generation)
+            else:
+                reward = -10  # penalty for unmet demand
+            
+        elif action == 2:  # sell excess energy
+            excess = max(0, total_generation - self.demand)
+            reward = excess * 5  # reward selling surplus
+        
+        # Randomly update demand and generation
+        self.demand = np.random.uniform(0.3, 0.8)
+        self.solar_generation = np.random.uniform(0.2, 0.7)
+        self.wind_generation = np.random.uniform(0.1, 0.5)
+        
+        # Keep battery within bounds
+        self.battery_level = np.clip(self.battery_level, 0, self.max_battery_capacity)
+        
+        obs = np.array([self.demand, self.solar_generation, self.wind_generation, self.battery_level], dtype=np.float32)
+        
+        return obs, reward, done, {}
+    
+    def render(self, mode='human'):
+        print(f"Demand: {self.demand:.2f}, Solar: {self.solar_generation:.2f}, Wind: {self.wind_generation:.2f}, Battery: {self.battery_level:.2f}")
+
+# Create Environment
+env = RenewableGridEnv()
+
+# Deep Q-Network
+model = tf.keras.Sequential([
+    layers.Dense(24, activation='relu', input_shape=(4,)),
+    layers.Dense(24, activation='relu'),
+    layers.Dense(env.action_space.n, activation='linear')
+])
+
+model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=0.001), loss='mse')
+
+# DQN Hyperparameters
+gamma = 0.95  # discount factor
+epsilon = 1.0  # exploration rate
+epsilon_min = 0.01
+epsilon_decay = 0.995
+batch_size = 32
+memory = []
+
+# Training Loop
+episodes = 500
+
+for e in range(episodes):
+    state = env.reset()
+    state = np.reshape(state, [1, 4])
+    
+    for time in range(200):
+        # Exploration-exploitation
+        if np.random.rand() <= epsilon:
+            action = env.action_space.sample()
+        else:
+            q_values = model.predict(state, verbose=0)
+            action = np.argmax(q_values[0])
+        
+        next_state, reward, done, _ = env.step(action)
+        next_state = np.reshape(next_state, [1, 4])
+        
+        # Store experience
+        memory.append((state, action, reward, next_state, done))
+        
+        if len(memory) > 1000:
+            memory.pop(0)
+        
+        state = next_state
+        
+        # Replay and train
+        if len(memory) >= batch_size:
+            minibatch = random.sample(memory, batch_size)
+            for s, a, r, s_next, d in minibatch:
+                target = r
+                if not d:
+                    target = r + gamma * np.amax(model.predict(s_next, verbose=0)[0])
+                target_f = model.predict(s, verbose=0)
+                target_f[0][a] = target
+                model.fit(s, target_f, epochs=1, verbose=0)
+        
+        if done:
+            break
+    
+    # Decay exploration rate
+    if epsilon > epsilon_min:
+        epsilon *= epsilon_decay
+    
+    if (e + 1) % 50 == 0:
+        print(f"Episode {e + 1}/{episodes} completed.")
+
+print("Training completed.")
